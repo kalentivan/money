@@ -1,61 +1,57 @@
-# Money — mock payment gateway demo
+# Money — Go payment mock demo
 
-A reproducible local demo built around [AcquireMock](https://github.com/ashfromsky/acquiremock) (Apache-2.0). **No real money or real cards.** The upstream application remains in its own repository; the launcher checks out a pinned version into a temporary build directory.
+A local demo of a mock payment provider using [AcquireMock](https://github.com/ashfromsky/acquiremock) (Apache-2.0), a **Go merchant UI**, and PostgreSQL. No real money or real card numbers.
 
-## Quick start
+## Run with Docker
 
-Prerequisites: Docker Engine/Desktop and Docker Compose v2, Git.
+Requires Docker Engine/Desktop with Compose v2. The payment service is built from a pinned upstream Git commit.
 
 ```bash
 git clone https://github.com/kalentivan/money.git
 cd money
 cp .env.example .env
-docker compose up --build -d
+docker compose up -d --build
 ```
 
-Open **http://localhost:8000/test** to create an invoice, then open the generated checkout URL. Test card: `4444 4444 4444 4444`, any future expiry and any 3-digit CVV. Enter an email; with SMTP disabled, the OTP is printed in the payment container logs:
+Visit **http://localhost:8080** — this is the **Go UI** for the demo merchant.
+
+1. Enter a reference and amount (in cents; `1500` means $15).
+2. Click "Создать счёт"; click the resulting "Открыть оплату" button.
+3. Enter **test card** `4444 4444 4444 4444`, any future expiry, any 3-digit CVV, and a test email.
+4. With SMTP disabled, retrieve OTP in the gateway container logs: `docker compose logs -f payment-mock`.
+5. Enter the OTP; a signed webhook is sent to Go and appears in the Go UI automatically (refreshes every 3 seconds).
+
+Additional pages: **http://localhost:8000/test** (upstream UI), **http://localhost:8000/docs** (gateway Swagger), **http://localhost:8080/events** (merchant webhook JSON), **http://localhost:8080/health**.
+
+## Test
+
+Go 1.23 or newer:
 
 ```bash
-docker compose logs -f payment-mock
+cd go-demo
+go test -race -v ./...
 ```
 
-After entering the OTP, the payment gateway sends an HMAC-signed webhook to the demo receiver. Inspect received and validated events at **http://localhost:8001/events** and visit **http://localhost:8001** for the event viewer.
+CI automatically runs Go tests and builds the app on every push.
 
-To test the API with an actual receiving endpoint:
+## Architecture
+
+```text
+Browser -> Go UI (:8080) -> POST /api/create-invoice -> AcquireMock (:8000)
+Browser -> AcquireMock checkout + OTP -> POST /webhook -> Go UI
+Go UI -> HMAC-SHA256 verification -> in-memory event list -> Browser
+AcquireMock -> PostgreSQL (:5432, internal Docker network)
+```
+
+The Go demo implements the merchant-side integration and webhook receiver. The original AcquireMock gateway stays upstream and is built at a pinned revision in Compose. Webhook event history in Go is **in-memory** and resets with its container; gateway payments persist in the PostgreSQL volume.
+
+The gateway signs the sorted JSON webhook payload using HMAC-SHA256. Go verifies the signature using a shared secret and deduplicates events by payment ID + status. Only signed events appear in the UI.
+
+**Configuration:** Copy `.env.example` to `.env`. Set `WEBHOOK_SECRET` to a strong secret before exposing this to another host. Both containers must use the same secret. `BASE_URL` is the browser-accessible URL to the gateway (by default `http://localhost:8000`). For local demonstrations only; not production-ready, and never use actual payment card data.
+
+Stop and clean up:
 
 ```bash
-python scripts/demo.py
+docker compose down
+docker compose down -v # also removes the demo database
 ```
-
-The script creates an invoice using `POST /api/create-invoice`, prints the checkout URL, and guides you to the demo receiver. `amount` is in minor units: `1500` means 15.00 USD.
-
-### Tests
-
-```bash
-python -m unittest discover -s tests -v
-```
-
-Tests validate the webhook HMAC handling (including rejection of tampered payloads), deduplication, and the local HTTP event viewer without requiring Docker. An optional end-to-end smoke test of the running stack:
-
-```bash
-python scripts/smoke.py
-```
-
-## Endpoints
-
-| URL | Use |
-|---|---|
-| http://localhost:8000/test | Built-in payment creation UI |
-| http://localhost:8000/docs | Payment API documentation |
-| http://localhost:8001 | Demo merchant dashboard |
-| http://localhost:8001/events | Received signed webhooks as JSON |
-| http://localhost:8001/health | Receiver health |
-
-## Notes
-
-- `WEBHOOK_SECRET` **must be identical** in both services. Replace the development secret in `.env` before sharing the demo on a network.
-- Browser URL (`localhost:8000`) is different from Docker-to-Docker URL (`http://webhook-demo:8001/webhook`). The test page might let you enter a custom webhook URL; use the Docker URL.
-- This repo deliberately uses the original AcquireMock source at the revision in `.env.example` rather than copying third-party source code. Upstream code is licensed under Apache-2.0; see its LICENSE.
-- Not suitable for production or handling actual payment information.
-
-Stop: `docker compose down` (add `-v` to delete demo database data).
