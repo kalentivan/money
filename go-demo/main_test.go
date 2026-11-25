@@ -85,7 +85,7 @@ func TestCreateRejectsInvalidAmount(t *testing.T) {
 }
 func TestIndexAndHealth(t *testing.T) {
   app:=NewApp("secret","http://localhost:1","http://localhost:8000","http://go-demo:8080/webhook")
-  for _,tc:=range []struct{path,needle string}{{"/","Money / Магазин"},{"/health","ok"}} {
+  for _,tc:=range []struct{path,needle string}{{"/","Money / Кинотеатр"},{"/health","ok"}} {
     w:=httptest.NewRecorder()
     app.Routes().ServeHTTP(w,httptest.NewRequest("GET",tc.path,nil))
     if w.Code!=200||!strings.Contains(w.Body.String(),tc.needle) {t.Fatalf("%s failed: %d",tc.path,w.Code)}
