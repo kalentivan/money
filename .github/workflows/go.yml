@@ -1,0 +1,22 @@
+name: Go Demo CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: go-demo
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go-demo/go.mod
+      - name: Test
+        run: go test -race -v ./...
+      - name: Build
+        run: go build ./...
