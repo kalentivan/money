@@ -1,0 +1,48 @@
+services:
+  payment-mock:
+    build:
+      context: https://github.com/ashfromsky/acquiremock.git#26f47bc68f7b6079fe424c21982533f018320c4c
+    environment:
+      DATABASE_URL: postgresql+asyncpg://acquiremock:acquiremock@db:5432/acquiremock_db
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-local-demo-only-signature-secret-change-me}
+      BASE_URL: ${BASE_URL:-http://localhost:8000}
+      CURRENCY_CODE: USD
+      CURRENCY_SYMBOL: "$"
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: acquiremock
+      POSTGRES_PASSWORD: acquiremock
+      POSTGRES_DB: acquiremock_db
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U acquiremock -d acquiremock_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+    volumes:
+      - payment_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  go-demo:
+    build: ./go-demo
+    environment:
+      ADDR: ":8080"
+      GATEWAY_URL: http://payment-mock:8000
+      PUBLIC_GATEWAY_URL: ${BASE_URL:-http://localhost:8000}
+      WEBHOOK_URL: http://go-demo:8080/webhook
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-local-demo-only-signature-secret-change-me}
+    ports:
+      - "8080:8080"
+    depends_on:
+      - payment-mock
+    restart: unless-stopped
+
+volumes:
+  payment_data:
