@@ -3,6 +3,7 @@ package main
 import (
   "bytes"
   "crypto/hmac"
+  "crypto/rand"
   "crypto/sha256"
   "encoding/hex"
   "encoding/json"
@@ -60,16 +61,22 @@ type App struct {
   webhookURL string
   client *http.Client
   store *Store
+  demoMu sync.Mutex
+  sessions map[string]string
+  orders map[string]*DemoOrder
 }
 func NewApp(secret, gateway, publicGateway, webhookURL string) *App {
-  return &App{secret: secret, gateway: strings.TrimRight(gateway, "/"), publicGateway: strings.TrimRight(publicGateway, "/"), webhookURL: webhookURL, client: &http.Client{Timeout: 8*time.Second}, store: newStore()}
+  return &App{secret: secret, gateway: strings.TrimRight(gateway, "/"), publicGateway: strings.TrimRight(publicGateway, "/"), webhookURL: webhookURL, client: &http.Client{Timeout: 8*time.Second}, store: newStore(), sessions: make(map[string]string), orders: make(map[string]*DemoOrder)}
 }
 func (a *App) Routes() http.Handler {
   mux := http.NewServeMux()
-  mux.HandleFunc("GET /", a.index)
-  mux.HandleFunc("POST /create", a.create)
+  mux.HandleFunc("GET /", a.shop)
+  mux.HandleFunc("POST /demo/login", a.demoLogin)
+  mux.HandleFunc("POST /demo/pay", a.demoPay)
+  mux.HandleFunc("GET /demo/orders", a.demoOrders)
+  
   mux.HandleFunc("POST /webhook", a.webhook)
-  mux.HandleFunc("GET /events", a.events)
+  
   mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, http.StatusOK, map[string]string{"status":"ok"}) })
   return mux
 }
@@ -114,6 +121,11 @@ func (a *App) webhook(w http.ResponseWriter,r *http.Request) {
   var event Event
   if err:=json.Unmarshal(raw,&event);err!=nil || event.PaymentID=="" || event.Reference=="" {log.Printf("Rejected webhook: invalid event: %v",err);http.Error(w,"invalid event",http.StatusBadRequest);return}
   event.ReceivedAt=time.Now().UTC().Format(time.RFC3339)
+  a.demoMu.Lock()
+  order:=a.orders[event.Reference]
+  if order==nil || order.PaymentID!=event.PaymentID || float64(order.Amount)!=event.Amount || event.Status!="paid" { a.demoMu.Unlock(); http.Error(w,"unknown or mismatched payment",400); return }
+  order.Status="paid"
+  a.demoMu.Unlock()
   added:=a.store.Add(event)
   log.Printf("Webhook accepted: payment=%s status=%s new=%t",event.PaymentID,event.Status,added)
   writeJSON(w,http.StatusOK,map[string]any{"received":true,"new":added})
@@ -168,6 +180,9 @@ func (a *App) create(w http.ResponseWriter,r *http.Request) {
   if len(reference)==0||len(reference)>100 {http.Error(w,"invalid reference",400);return}
   var amount int64
   if _,err:=fmt.Sscan(r.FormValue("amount"),&amount);err!=nil||amount<=0||amount>100000000 {http.Error(w,"invalid amount",400);return}
+  a.issueInvoice(w,r,reference,amount)
+}
+func (a *App) issueInvoice(w http.ResponseWriter,r *http.Request,reference string,amount int64) {
   payload:=map[string]any{"amount":amount,"reference":reference,"webhookUrl":a.webhookURL,"redirectUrl":"http://localhost:8080/"}
   body,_:=json.Marshal(payload)
   req,err:=http.NewRequestWithContext(r.Context(),http.MethodPost,a.gateway+"/api/create-invoice",bytes.NewReader(body))
@@ -195,3 +210,55 @@ func main() {
   log.Printf("Go demo listening on %s",addr)
   if err:=http.ListenAndServe(addr,app.Routes());err!=nil&&!errors.Is(err,http.ErrServerClosed){log.Fatal(err)}
 }
+
+type DemoOrder struct {
+  ID string `json:"id"`
+  Owner string `json:"-"`
+  Amount int64 `json:"amount"`
+  Status string `json:"status"`
+  PaymentID string `json:"payment_id"`
+  PageURL string `json:"page_url,omitempty"`
+}
+func (a *App) clientID(r *http.Request) string {
+  c,e:=r.Cookie("demo_session"); if e!=nil{return ""}
+  a.demoMu.Lock(); defer a.demoMu.Unlock(); return a.sessions[c.Value]
+}
+func (a *App) demoLogin(w http.ResponseWriter,r *http.Request) {
+  if r.ParseForm()!=nil {http.Error(w,"bad form",400);return}
+  id:=r.FormValue("client"); if id!="alice"&&id!="bob" {http.Error(w,"unknown client",400);return}
+  b:=make([]byte,32); if _,e:=rand.Read(b);e!=nil{http.Error(w,"session error",500);return}
+  token:=hex.EncodeToString(b)
+  a.demoMu.Lock(); if old,e:=r.Cookie("demo_session");e==nil{delete(a.sessions,old.Value)}; a.sessions[token]=id; a.demoMu.Unlock()
+  http.SetCookie(w,&http.Cookie{Name:"demo_session",Value:token,Path:"/",HttpOnly:true,SameSite:http.SameSiteStrictMode})
+  http.Redirect(w,r,"/",303)
+}
+func (a *App) demoOrders(w http.ResponseWriter,r *http.Request) {
+  owner:=a.clientID(r); if owner==""{http.Error(w,"login required",401);return}
+  a.demoMu.Lock(); defer a.demoMu.Unlock()
+  out:=[]DemoOrder{}; for _,o:=range a.orders{if o.Owner==owner{out=append(out,*o)}}
+  writeJSON(w,200,out)
+}
+func (a *App) demoPay(w http.ResponseWriter,r *http.Request) {
+  owner:=a.clientID(r); if owner==""{http.Error(w,"login required",401);return}
+  if r.ParseForm()!=nil{http.Error(w,"bad form",400);return}
+  id:=strings.TrimSpace(r.FormValue("order")); if id==""||len(id)>60{http.Error(w,"invalid order",400);return}
+  // Demo catalog: server-owned orders, not client-provided prices.
+  prices:=map[string]int64{"1001":1500,"1002":2500,"2001":900,"2002":3200}
+  owners:=map[string]string{"1001":"alice","1002":"alice","2001":"bob","2002":"bob"}
+  if owners[id]!=owner{http.Error(w,"order not found",404);return}
+  a.demoMu.Lock(); defer a.demoMu.Unlock()
+  if o:=a.orders[id];o!=nil{if o.Status=="paid"{http.Error(w,"already paid",409);return};http.Redirect(w,r,o.PageURL,303);return}
+  payload,_:=json.Marshal(map[string]any{"amount":prices[id],"reference":id,"webhookUrl":a.webhookURL,"redirectUrl":"http://localhost:8080/"})
+  req,e:=http.NewRequestWithContext(r.Context(),"POST",a.gateway+"/api/create-invoice",bytes.NewReader(payload));if e!=nil{http.Error(w,"gateway error",502);return}
+  req.Header.Set("Content-Type","application/json")
+  resp,e:=a.client.Do(req);if e!=nil{http.Error(w,"gateway unavailable",502);return};defer resp.Body.Close()
+  var result struct{PageURL string `json:"pageUrl"`}
+  if resp.StatusCode!=200||json.NewDecoder(io.LimitReader(resp.Body,4096)).Decode(&result)!=nil{http.Error(w,"gateway error",502);return}
+  u,e:=url.Parse(result.PageURL);if e!=nil||!strings.HasPrefix(u.Path,"/checkout/"){http.Error(w,"invalid checkout",502);return}
+  pid:=strings.TrimPrefix(u.Path,"/checkout/");if pid==""||strings.Contains(pid,"/"){http.Error(w,"invalid checkout",502);return}
+  checkout:=a.publicGateway+u.EscapedPath()
+  a.orders[id]=&DemoOrder{ID:id,Owner:owner,Amount:prices[id],Status:"pending",PaymentID:pid,PageURL:checkout}
+  http.Redirect(w,r,checkout,303)
+}
+var shopPage=template.Must(template.New("shop").Parse(`<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Money / Shop</title><style>body{background:#101424;color:#eee;font:16px system-ui;max-width:850px;margin:40px auto;padding:16px}section{background:#1c2336;padding:24px;border-radius:12px;margin:16px 0}input,select,button{padding:12px;margin:8px;border-radius:7px;font:inherit}button{background:#a392ff;border:0;cursor:pointer}table{width:100%;text-align:left}td,th{padding:10px;border-bottom:1px solid #444}small{color:#b9bed1}</style><h1>Money / Магазин</h1><section><h2>Выбрать клиента</h2><form action="/demo/login" method="post"><select name="client"><option value="alice">Алиса</option><option value="bob">Борис</option></select><button>Войти</button></form><small>Демонстрационное переключение личности, не настоящая авторизация.</small></section>{{if .}}<section><h2>Клиент: {{.}}</h2><p>{{if eq . "alice"}}Заказы: 1001 — $1500; 1002 — $2500{{else}}Заказы: 2001 — $900; 2002 — $3200{{end}}</p><form action="/demo/pay" method="post"><input name="order" placeholder="Номер заказа" required><button>Оплатить</button></form><small>Карта 4444 4444 4444 4444, OTP 1234. Сумма определяется сервером.</small></section><section><h2>Мои платежи</h2><table><thead><tr><th>Заказ</th><th>Сумма USD</th><th>Статус</th><th>Payment ID</th></tr></thead><tbody id="rows"></tbody></table><p id="error"></p></section><script>async function refresh(){try{let r=await fetch('/demo/orders');if(!r.ok)throw Error('Ошибка '+r.status);let data=await r.json();let b=document.getElementById('rows');b.replaceChildren();for(let o of data){let tr=b.insertRow();for(let v of [o.id,o.amount,o.status,o.payment_id])tr.insertCell().textContent=v}document.getElementById('error').textContent=''}catch(e){document.getElementById('error').textContent=e.message}}refresh();setInterval(refresh,3000)</script>{{end}}</html>`))
+func (a *App) shop(w http.ResponseWriter,r *http.Request){w.Header().Set("Content-Type","text/html; charset=utf-8"); _=shopPage.Execute(w,a.clientID(r))}
