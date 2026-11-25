@@ -23,7 +23,7 @@ import (
 type Event struct {
   PaymentID string `json:"payment_id"`
   Reference string `json:"reference"`
-  Amount int64 `json:"amount"`
+  Amount float64 `json:"amount"`
   Status string `json:"status"`
   Timestamp string `json:"timestamp"`
   CardMask string `json:"card_mask,omitempty"`
@@ -48,7 +48,7 @@ func (s *Store) Add(e Event) bool {
 func (s *Store) List() []Event {
   s.mu.Lock()
   defer s.mu.Unlock()
-  out := append([]Event(nil), s.events...)
+  out := append([]Event{}, s.events...)
   sort.SliceStable(out, func(i,j int) bool { return out[i].ReceivedAt > out[j].ReceivedAt })
   return out
 }
@@ -112,9 +112,10 @@ func (a *App) webhook(w http.ResponseWriter,r *http.Request) {
   received:=strings.TrimSpace(r.Header.Get("X-Signature"))
   if !hmac.Equal([]byte(received),[]byte(expected)) {http.Error(w,"invalid HMAC signature",http.StatusForbidden);return}
   var event Event
-  if err:=json.Unmarshal(raw,&event);err!=nil || event.PaymentID=="" || event.Reference=="" {http.Error(w,"invalid event",http.StatusBadRequest);return}
+  if err:=json.Unmarshal(raw,&event);err!=nil || event.PaymentID=="" || event.Reference=="" {log.Printf("Rejected webhook: invalid event: %v",err);http.Error(w,"invalid event",http.StatusBadRequest);return}
   event.ReceivedAt=time.Now().UTC().Format(time.RFC3339)
   added:=a.store.Add(event)
+  log.Printf("Webhook accepted: payment=%s status=%s new=%t",event.PaymentID,event.Status,added)
   writeJSON(w,http.StatusOK,map[string]any{"received":true,"new":added})
 }
 func (a *App) events(w http.ResponseWriter,r *http.Request) {writeJSON(w,http.StatusOK,a.store.List())}
@@ -137,12 +138,12 @@ pre{overflow:auto;white-space:pre-wrap;word-break:break-word;background:#0d1222;
 <p class="subtitle">Тестовый магазин на Go → AcquireMock → HMAC webhook → события. Никаких реальных списаний.</p>
 <div class="grid"><section class="card"><h2>Создать платёж</h2>
 <form id="pay"><label>Номер заказа</label><input name="reference" required value="ORDER-DEMO-001">
-<label>Сумма, центы (1500 = $15.00)</label><input name="amount" type="number" min="1" max="100000000" required value="1500">
+<label>Сумма, USD (1500 = $1500.00)</label><input name="amount" type="number" min="1" max="100000000" required value="1500">
 <button>Создать счёт</button></form><p class="small" id="message"></p>
 <div id="checkout" hidden><a class="btn" id="checkoutLink" target="_blank" rel="noopener">Открыть оплату ↗</a>
-<p class="small">Карта: 4444 4444 4444 4444 · срок — будущая дата · CVV — любые 3 цифры. OTP ищите в логах Docker.</p></div>
-</section><section class="card"><h2>Как это работает</h2><ol><li>Создайте счёт в форме</li><li>Перейдите на страницу оплаты</li><li>Введите тестовую карту и почту</li><li>Введите OTP из логов payment-mock</li><li>Получите подтверждённый webhook ниже</li></ol>
-<p class="small">Для OTP: <code>docker compose logs -f payment-mock</code></p><a href="{{.PublicGateway}}/test" target="_blank" rel="noopener">Встроенный тестовый UI AcquireMock ↗</a></section></div>
+<p class="small">Карта: 4444 4444 4444 4444 · срок — будущая дата · CVV — любые 3 цифры. OTP: 1234.</p></div>
+</section><section class="card"><h2>Как это работает</h2><ol><li>Создайте счёт в форме</li><li>Перейдите на страницу оплаты</li><li>Введите тестовую карту и почту</li><li>Введите OTP 1234</li><li>Получите подтверждённый webhook ниже</li></ol>
+<p class="small">Тестовый OTP: <code>1234</code></p><a href="{{.PublicGateway}}/test" target="_blank" rel="noopener">Встроенный тестовый UI AcquireMock ↗</a></section></div>
 <section class="card" style="margin-top:18px"><h2>Полученные webhooks <span class="status" id="count"></span></h2><p class="small">Автообновление каждые 3 секунды, проверка HMAC-SHA256, повторы не дублируются</p>
 <div style="overflow-x:auto"><table><thead><tr><th>Заказ</th><th>Payment ID</th><th>Сумма</th><th>Статус</th><th>Получен</th></tr></thead><tbody id="events"><tr><td colspan="5">Пока пусто</td></tr></tbody></table></div></section></div>
 <script>
@@ -153,7 +154,7 @@ message.textContent='Счёт создан. Откройте страницу о
 }catch(err){message.textContent='Ошибка: '+err.message}});
 async function refresh(){try{const res=await fetch('/events');const events=await res.json();document.getElementById('count').textContent='('+events.length+')';
 const tbody=document.getElementById('events');tbody.replaceChildren();if(!events.length){const tr=tbody.insertRow();const td=tr.insertCell();td.colSpan=5;td.textContent='Пока пусто';return;}
-for(const ev of events){const tr=tbody.insertRow();for(const v of [ev.reference,ev.payment_id,(ev.amount/100).toFixed(2),ev.status,ev.received_at]){tr.insertCell().textContent=v??'';}}}catch(_){}}
+for(const ev of events){const tr=tbody.insertRow();for(const v of [ev.reference,ev.payment_id,ev.amount.toFixed(2),ev.status,ev.received_at]){tr.insertCell().textContent=v??'';}}}catch(_){}}
 refresh();setInterval(refresh,3000);
 </script></body></html>`))
 
