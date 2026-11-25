@@ -11,6 +11,7 @@ import (
   "html/template"
   "io"
   "log"
+  "net/url"
   "net/http"
   "os"
   "sort"
@@ -81,9 +82,9 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 // AcquireMock signs JSON encoded with Python json.dumps(..., sort_keys=True).
 // Default separators include spaces, and escape_non_ascii=true.
 // The gateway currently emits ASCII keys/values in the webhook payload.
-func pythonCanonical(value any) ([]byte, error) {
+func pythonCanonical(raw []byte) ([]byte, error) {
   var m map[string]json.RawMessage
-  if err := json.Unmarshal(value.([]byte), &m); err != nil { return nil, err }
+  if err := json.Unmarshal(raw, &m); err != nil { return nil, err }
   keys := make([]string,0,len(m))
   for k := range m { keys=append(keys,k) }
   sort.Strings(keys)
@@ -92,7 +93,7 @@ func pythonCanonical(value any) ([]byte, error) {
     key,_ := json.Marshal(k)
     var compact bytes.Buffer
     if err := json.Compact(&compact,m[k]); err!=nil { return nil,err }
-    parts=append(parts,string(key)+": "+strings.ReplaceAll(compact.String(), ",", ", "))
+    parts=append(parts,string(key)+": "+compact.String())
   }
   return []byte("{"+strings.Join(parts,", ")+"}"),nil
 }
@@ -178,8 +179,10 @@ func (a *App) create(w http.ResponseWriter,r *http.Request) {
   if err!=nil||resp.StatusCode!=200 {writeJSON(w,502,map[string]string{"error":"Payment gateway rejected invoice"});return}
   var result struct{PageURL string `json:"pageUrl"`}
   if json.Unmarshal(b,&result)!=nil||result.PageURL=="" {writeJSON(w,502,map[string]string{"error":"Invalid response from gateway"});return}
-  // Ensure checkout URL points to the browser-facing address, not a Docker hostname.
-  if !strings.HasPrefix(result.PageURL,a.publicGateway+"/") {result.PageURL=a.publicGateway+"/checkout/"+strings.TrimPrefix(result.PageURL,strings.TrimSuffix(result.PageURL,"/"))}
+  // Rebuild only from a validated checkout path, never trust the supplied host.
+  parsed,err:=url.Parse(result.PageURL)
+  if err!=nil || !strings.HasPrefix(parsed.Path,"/checkout/") || len(strings.TrimPrefix(parsed.Path,"/checkout/"))<8 {writeJSON(w,502,map[string]string{"error":"Unexpected checkout URL from gateway"});return}
+  result.PageURL=a.publicGateway+parsed.EscapedPath()
   writeJSON(w,200,map[string]string{"pageUrl":result.PageURL})
 }
 func env(k, fallback string) string {if v:=os.Getenv(k);v!="" {return v};return fallback}
